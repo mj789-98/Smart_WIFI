@@ -63,34 +63,51 @@ public sealed class WiFiManager
                 message: "WiFi is already connected.");
         }
 
-        var profileName = _settings.LastConnectedProfileName;
-        if (string.IsNullOrWhiteSpace(profileName))
+        // Build the candidate list from Windows' saved profile list (priority-ordered, no Location
+        // Services required). Fall back to the stored profile name only if the API returns nothing.
+        IReadOnlyList<string> candidates = NativeWifi.GetSavedProfiles(adapterName);
+        if (candidates.Count == 0 && !string.IsNullOrWhiteSpace(_settings.LastConnectedProfileName))
         {
-            return WiFiCommandResult.Failure("No remembered WiFi profile is available to reconnect.");
+            candidates = new[] { _settings.LastConnectedProfileName };
         }
 
-        // Try the native WLAN API first (no Location Services requirement).
-        var nativeSuccess = NativeWifi.TryConnect(adapterName, profileName);
-        if (!nativeSuccess)
+        if (candidates.Count == 0)
         {
-            // Fallback to netsh.
-            var output = ExecuteNetsh($"wlan connect name=\"{profileName}\" interface=\"{adapterName}\"");
-            if (output.ExitCode != 0)
+            return WiFiCommandResult.Failure("No saved WiFi profiles found to reconnect with.");
+        }
+
+        foreach (var profileName in candidates)
+        {
+            // Try the native WLAN API first (no Location Services requirement).
+            var nativeSuccess = NativeWifi.TryConnect(adapterName, profileName);
+            if (!nativeSuccess)
             {
-                return WiFiCommandResult.Failure($"Failed to reconnect WiFi. {output.Output}".Trim());
+                // Fallback to netsh. The connect command does not require Location Services —
+                // only read commands (show interfaces) do.
+                var output = ExecuteNetsh($"wlan connect name=\"{profileName}\" interface=\"{adapterName}\"");
+                if (output.ExitCode != 0)
+                {
+                    // Neither method could issue the connect for this profile; move to the next.
+                    continue;
+                }
+            }
+
+            // Give Windows a short window (2 s) to establish the connection before moving on.
+            var status = WaitForConnectionState(adapterName, expectedConnected: true, attempts: 4);
+            if (status.IsConnected == true)
+            {
+                // Persist the winning profile so future cycles can reconnect without scanning the full list.
+                _settings.LastConnectedProfileName = status.ProfileName ?? profileName;
+                _settings.Save();
+
+                return WiFiCommandResult.FromSuccess(
+                    changed: true,
+                    status: status,
+                    message: "WiFi connected.");
             }
         }
 
-        var finalStatus = WaitForConnectionState(adapterName, expectedConnected: true);
-        if (finalStatus.IsConnected == true)
-        {
-            return WiFiCommandResult.FromSuccess(
-                changed: true,
-                status: finalStatus,
-                message: "WiFi connected.");
-        }
-
-        return WiFiCommandResult.Failure("WiFi reconnect command completed, but the connection could not be confirmed.");
+        return WiFiCommandResult.Failure("Could not reconnect using any saved Windows WiFi profile.");
     }
 
     public WiFiCommandResult Disconnect()
@@ -216,9 +233,9 @@ public sealed class WiFiManager
             .FirstOrDefault();
     }
 
-    private WiFiConnectionStatus WaitForConnectionState(string adapterName, bool expectedConnected)
+    private WiFiConnectionStatus WaitForConnectionState(string adapterName, bool expectedConnected, int attempts = 8)
     {
-        for (var attempt = 0; attempt < 8; attempt++)
+        for (var attempt = 0; attempt < attempts; attempt++)
         {
             var status = GetStatus();
             if (status.IsConnected == expectedConnected)

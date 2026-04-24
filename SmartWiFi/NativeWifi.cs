@@ -172,6 +172,63 @@ internal static class NativeWifi
         }
     }
 
+    /// <summary>
+    /// Returns the saved WiFi profile names for the specified adapter in Windows' priority order.
+    /// Uses WlanGetProfileList — no Location Services requirement.
+    /// Returns an empty list on any failure (never throws).
+    /// </summary>
+    public static IReadOnlyList<string> GetSavedProfiles(string adapterName)
+    {
+        var adapterGuid = ResolveAdapterGuid(adapterName);
+        if (adapterGuid is null)
+        {
+            return Array.Empty<string>();
+        }
+
+        var result = WlanOpenHandle(ClientVersion, IntPtr.Zero, out _, out var clientHandle);
+        if (result != 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        try
+        {
+            result = WlanGetProfileList(clientHandle, adapterGuid.Value, IntPtr.Zero, out var profileListPointer);
+            if (result != 0 || profileListPointer == IntPtr.Zero)
+            {
+                return Array.Empty<string>();
+            }
+
+            try
+            {
+                var header = Marshal.PtrToStructure<WlanProfileInfoListHeader>(profileListPointer);
+                var profiles = new List<string>(header.NumberOfItems);
+                var itemOffset = Marshal.SizeOf<WlanProfileInfoListHeader>();
+                var itemSize = Marshal.SizeOf<WlanProfileInfo>();
+
+                for (var i = 0; i < header.NumberOfItems; i++)
+                {
+                    var itemPointer = IntPtr.Add(profileListPointer, itemOffset + (i * itemSize));
+                    var profileInfo = Marshal.PtrToStructure<WlanProfileInfo>(itemPointer);
+                    if (!string.IsNullOrWhiteSpace(profileInfo.ProfileName))
+                    {
+                        profiles.Add(profileInfo.ProfileName);
+                    }
+                }
+
+                return profiles;
+            }
+            finally
+            {
+                WlanFreeMemory(profileListPointer);
+            }
+        }
+        finally
+        {
+            WlanCloseHandle(clientHandle, IntPtr.Zero);
+        }
+    }
+
     private static Guid? ResolveAdapterGuid(string adapterName)
     {
         var adapter = NetworkInterface.GetAllNetworkInterfaces()
@@ -240,6 +297,13 @@ internal static class NativeWifi
         [MarshalAs(UnmanagedType.LPStruct)] Guid interfaceGuid,
         IntPtr reserved);
 
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanGetProfileList(
+        IntPtr clientHandle,
+        [MarshalAs(UnmanagedType.LPStruct)] Guid interfaceGuid,
+        IntPtr reserved,
+        out IntPtr profileList);
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct WlanConnectionParameters
     {
@@ -267,6 +331,22 @@ internal static class NativeWifi
     {
         public int NumberOfItems;
         public int Index;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WlanProfileInfoListHeader
+    {
+        public int NumberOfItems;
+        public int Index;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WlanProfileInfo
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string ProfileName;
+
+        public uint Flags;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
