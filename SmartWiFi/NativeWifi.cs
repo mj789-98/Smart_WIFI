@@ -173,9 +173,10 @@ internal static class NativeWifi
     }
 
     /// <summary>
-    /// Returns the saved WiFi profile names for the specified adapter in Windows' priority order.
-    /// Uses WlanGetProfileList — no Location Services requirement.
-    /// Returns an empty list on any failure (never throws).
+    /// Returns the saved WiFi profile names for the specified adapter,
+    /// in Windows priority order (most preferred first).
+    /// Uses WlanGetProfileList which does NOT require Location Services.
+    /// Returns an empty list on any failure — never throws.
     /// </summary>
     public static IReadOnlyList<string> GetSavedProfiles(string adapterName)
     {
@@ -206,10 +207,11 @@ internal static class NativeWifi
                 var itemOffset = Marshal.SizeOf<WlanProfileInfoListHeader>();
                 var itemSize = Marshal.SizeOf<WlanProfileInfo>();
 
-                for (var i = 0; i < header.NumberOfItems; i++)
+                for (var index = 0; index < header.NumberOfItems; index++)
                 {
-                    var itemPointer = IntPtr.Add(profileListPointer, itemOffset + (i * itemSize));
+                    var itemPointer = IntPtr.Add(profileListPointer, itemOffset + (index * itemSize));
                     var profileInfo = Marshal.PtrToStructure<WlanProfileInfo>(itemPointer);
+
                     if (!string.IsNullOrWhiteSpace(profileInfo.ProfileName))
                     {
                         profiles.Add(profileInfo.ProfileName);

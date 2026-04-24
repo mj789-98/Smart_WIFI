@@ -63,51 +63,113 @@ public sealed class WiFiManager
                 message: "WiFi is already connected.");
         }
 
-        // Build the candidate list from Windows' saved profile list (priority-ordered, no Location
-        // Services required). Fall back to the stored profile name only if the API returns nothing.
-        IReadOnlyList<string> candidates = NativeWifi.GetSavedProfiles(adapterName);
-        if (candidates.Count == 0 && !string.IsNullOrWhiteSpace(_settings.LastConnectedProfileName))
-        {
-            candidates = new[] { _settings.LastConnectedProfileName };
-        }
+        // Build the candidate profile list from Windows' saved profiles
+        // (priority-ordered, does NOT require Location Services).
+        var savedProfiles = NativeWifi.GetSavedProfiles(adapterName);
+        var candidates = PrioritizeCandidates(savedProfiles, _settings.LastConnectedProfileName);
 
         if (candidates.Count == 0)
         {
-            return WiFiCommandResult.Failure("No saved WiFi profiles found to reconnect with.");
+            return WiFiCommandResult.Failure("No saved WiFi profiles found on this machine to reconnect.");
         }
 
-        foreach (var profileName in candidates)
+        // Limit the number of profiles we attempt to avoid long connect/disconnect
+        // cycling — each attempt involves a full WPA handshake wait (~4 s).
+        const int maxProfilesToTry = 5;
+
+        foreach (var profile in candidates.Take(maxProfilesToTry))
         {
-            // Try the native WLAN API first (no Location Services requirement).
-            var nativeSuccess = NativeWifi.TryConnect(adapterName, profileName);
-            if (!nativeSuccess)
+            // Try the native WLAN API. If it returns false the API rejected the
+            // request outright (invalid profile, adapter busy, etc.) — skip it
+            // entirely. Calling netsh here would just trigger another visible
+            // disconnect/reconnect cycle for a profile that won't work anyway.
+            if (!NativeWifi.TryConnect(adapterName, profile))
             {
-                // Fallback to netsh. The connect command does not require Location Services —
-                // only read commands (show interfaces) do.
-                var output = ExecuteNetsh($"wlan connect name=\"{profileName}\" interface=\"{adapterName}\"");
-                if (output.ExitCode != 0)
-                {
-                    // Neither method could issue the connect for this profile; move to the next.
-                    continue;
-                }
+                continue;
             }
 
-            // Give Windows a short window (2 s) to establish the connection before moving on.
-            var status = WaitForConnectionState(adapterName, expectedConnected: true, attempts: 4);
-            if (status.IsConnected == true)
+            // The API accepted the connection request. Give the full 4 s
+            // (8 × 500 ms) for the WPA/WPA2 handshake to complete — 2 s was
+            // too short and caused the adapter to cycle before authentication
+            // could finish.
+            var checkStatus = WaitForConnectionState(adapterName, expectedConnected: true, maxAttempts: 8);
+            if (checkStatus.IsConnected == true)
             {
-                // Persist the winning profile so future cycles can reconnect without scanning the full list.
-                _settings.LastConnectedProfileName = status.ProfileName ?? profileName;
+                // Persist this profile so future reconnects can use the
+                // fast single-profile path without walking the list again.
+                _settings.LastConnectedProfileName = profile;
                 _settings.Save();
 
                 return WiFiCommandResult.FromSuccess(
                     changed: true,
-                    status: status,
+                    status: checkStatus,
                     message: "WiFi connected.");
             }
         }
 
-        return WiFiCommandResult.Failure("Could not reconnect using any saved Windows WiFi profile.");
+        return WiFiCommandResult.Failure("Could not reconnect using any saved Windows profile.");
+    }
+
+    /// <summary>
+    /// Builds the candidate list with <paramref name="preferredProfile"/> at the front
+    /// (if it exists in the saved list), followed by the rest in Windows-priority order.
+    /// If <paramref name="savedProfiles"/> is empty, falls back to a single-element list
+    /// containing <paramref name="preferredProfile"/> (when non-blank).
+    /// </summary>
+    private static IReadOnlyList<string> PrioritizeCandidates(
+        IReadOnlyList<string> savedProfiles,
+        string? preferredProfile)
+    {
+        if (savedProfiles.Count == 0)
+        {
+            return string.IsNullOrWhiteSpace(preferredProfile)
+                ? Array.Empty<string>()
+                : new[] { preferredProfile };
+        }
+
+        if (string.IsNullOrWhiteSpace(preferredProfile))
+        {
+            return savedProfiles;
+        }
+
+        // Check whether the preferred profile is already in the list.
+        var preferredIndex = -1;
+        for (var i = 0; i < savedProfiles.Count; i++)
+        {
+            if (string.Equals(savedProfiles[i], preferredProfile, StringComparison.OrdinalIgnoreCase))
+            {
+                preferredIndex = i;
+                break;
+            }
+        }
+
+        if (preferredIndex < 0)
+        {
+            // Preferred profile is not in the Windows list — prepend it anyway
+            // so we still attempt it first (it might have been removed from the
+            // list but remain connectable).
+            var result = new List<string>(savedProfiles.Count + 1) { preferredProfile };
+            result.AddRange(savedProfiles);
+            return result;
+        }
+
+        if (preferredIndex == 0)
+        {
+            // Already at the front — nothing to reorder.
+            return savedProfiles;
+        }
+
+        // Move the preferred profile to the front; keep the rest in order.
+        var reordered = new List<string>(savedProfiles.Count) { preferredProfile };
+        for (var i = 0; i < savedProfiles.Count; i++)
+        {
+            if (i != preferredIndex)
+            {
+                reordered.Add(savedProfiles[i]);
+            }
+        }
+
+        return reordered;
     }
 
     public WiFiCommandResult Disconnect()
@@ -233,9 +295,9 @@ public sealed class WiFiManager
             .FirstOrDefault();
     }
 
-    private WiFiConnectionStatus WaitForConnectionState(string adapterName, bool expectedConnected, int attempts = 8)
+    private WiFiConnectionStatus WaitForConnectionState(string adapterName, bool expectedConnected, int maxAttempts = 8)
     {
-        for (var attempt = 0; attempt < attempts; attempt++)
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             var status = GetStatus();
             if (status.IsConnected == expectedConnected)
