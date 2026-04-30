@@ -314,7 +314,14 @@ public sealed class WiFiManager
     private static WiFiInterfaceInfo? TryGetInterfaceInfo(string adapterName)
     {
         var nativeInfo = NativeWifi.TryGetConnectionInfo(adapterName);
-        if (nativeInfo is not null)
+
+        // Only skip the netsh path when native gave us a usable profile name.
+        // WlanQueryInterface(CurrentConnection) can succeed but return an empty
+        // profile name (e.g. right after connecting to a new network, or when
+        // the connection uses a temporary/discovery profile). If we returned
+        // here in that case, LastConnectedProfileName would stay stale and
+        // SmartWiFi would try to reconnect to the wrong network.
+        if (nativeInfo is not null && !string.IsNullOrWhiteSpace(nativeInfo.ProfileName))
         {
             return new WiFiInterfaceInfo(adapterName, nativeInfo.IsConnected, nativeInfo.ProfileName, nativeInfo.Ssid);
         }
@@ -322,7 +329,11 @@ public sealed class WiFiManager
         var output = ExecuteNetsh("wlan show interfaces");
         if (output.ExitCode != 0 || string.IsNullOrWhiteSpace(output.Output))
         {
-            return null;
+            // netsh unavailable — return whatever native gave us (may have connection
+            // state without a profile name, which is still better than null).
+            return nativeInfo is not null
+                ? new WiFiInterfaceInfo(adapterName, nativeInfo.IsConnected, null, nativeInfo.Ssid)
+                : null;
         }
 
         WiFiInterfaceInfoBuilder? current = null;
@@ -346,7 +357,7 @@ public sealed class WiFiManager
             {
                 if (current is not null && string.Equals(current.Name, adapterName, StringComparison.OrdinalIgnoreCase))
                 {
-                    return current.Build();
+                    break;
                 }
 
                 current = new WiFiInterfaceInfoBuilder
@@ -378,10 +389,26 @@ public sealed class WiFiManager
 
         if (current is not null && string.Equals(current.Name, adapterName, StringComparison.OrdinalIgnoreCase))
         {
-            return current.Build();
+            var netshResult = current.Build();
+
+            // Prefer native connection state (comes from the WLAN state machine,
+            // not string parsing) but fill in the profile name from netsh when
+            // native didn't supply one.
+            if (nativeInfo is not null)
+            {
+                return new WiFiInterfaceInfo(
+                    adapterName,
+                    nativeInfo.IsConnected,
+                    string.IsNullOrWhiteSpace(nativeInfo.ProfileName) ? netshResult.ProfileName : nativeInfo.ProfileName,
+                    nativeInfo.Ssid ?? netshResult.Ssid);
+            }
+
+            return netshResult;
         }
 
-        return null;
+        return nativeInfo is not null
+            ? new WiFiInterfaceInfo(adapterName, nativeInfo.IsConnected, null, nativeInfo.Ssid)
+            : null;
     }
 
     private static ProcessResult ExecuteNetsh(string arguments)
